@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Claude to Graphiti Integration Hook
-Captures Claude conversation data and sends it to Graphiti knowledge graph
-Uses existing Graphiti API patterns from the codebase
+Claude to Graphiti Integration Hook - Enhanced Version
+Captures Claude conversation data including full context and sends it to Graphiti knowledge graph
 """
 
 import json
@@ -10,7 +9,7 @@ import sys
 import os
 import requests
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
 import uuid
 
@@ -26,71 +25,195 @@ GRAPHITI_URL = os.getenv("GRAPHITI_URL", "http://192.168.50.90:8001")
 GRAPHITI_TIMEOUT = int(os.getenv("GRAPHITI_TIMEOUT", "30"))
 CLAUDE_GROUP_ID = "claude_conversations"  # Group ID for Claude conversations
 
+class TranscriptParser:
+    """Parse Claude transcript files to extract conversation context"""
+    
+    def parse_transcript(self, transcript_path: str) -> List[Dict]:
+        """Parse JSONL transcript file and extract messages"""
+        messages = []
+        full_path = os.path.expanduser(transcript_path)
+        
+        if not os.path.exists(full_path):
+            logger.warning(f"Transcript file not found: {full_path}")
+            return messages
+            
+        try:
+            with open(full_path, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            entry = json.loads(line)
+                            self._process_entry(entry, messages)
+                        except json.JSONDecodeError:
+                            continue
+                            
+        except Exception as e:
+            logger.error(f"Error reading transcript: {e}")
+            
+        return messages
+        
+    def _process_entry(self, entry: Dict, messages: List[Dict]) -> None:
+        """Process a single transcript entry"""
+        entry_type = entry.get('type', '')
+        
+        if entry_type == 'user' and 'message' in entry:
+            messages.append({
+                'type': 'user',
+                'content': entry['message'].get('content', ''),
+                'timestamp': entry.get('timestamp', ''),
+                'uuid': entry.get('uuid', ''),
+                'sessionId': entry.get('sessionId', '')
+            })
+        elif entry_type == 'assistant' and 'message' in entry:
+            messages.append({
+                'type': 'assistant', 
+                'content': entry['message'].get('content', ''),
+                'timestamp': entry.get('timestamp', ''),
+                'uuid': entry.get('uuid', ''),
+                'sessionId': entry.get('sessionId', '')
+            })
+        elif entry_type == 'tool_use':
+            messages.append({
+                'type': 'tool_use',
+                'tool': entry.get('toolName', ''),
+                'input': entry.get('input', {}),
+                'timestamp': entry.get('timestamp', ''),
+                'uuid': entry.get('uuid', ''),
+                'sessionId': entry.get('sessionId', '')
+            })
+        elif entry_type == 'tool_result':
+            messages.append({
+                'type': 'tool_result',
+                'tool': entry.get('toolName', ''),
+                'output': str(entry.get('output', ''))[:500],  # Truncate long outputs
+                'error': entry.get('isError', False),
+                'timestamp': entry.get('timestamp', ''),
+                'uuid': entry.get('uuid', ''),
+                'sessionId': entry.get('sessionId', '')
+            })
+
 class GraphitiIntegration:
     def __init__(self):
         self.base_url = GRAPHITI_URL
         self.session = requests.Session()
+        self.parser = TranscriptParser()
         
     def process_tool_event(self, event_data: Dict) -> None:
-        """Process Claude tool events and send to Graphiti"""
+        """Process Claude tool events and send to Graphiti with conversation context"""
         try:
             # Extract relevant information
-            tool_name = event_data.get("tool", "")
-            tool_type = event_data.get("type", "")
+            tool_name = event_data.get("tool_name", "")
             timestamp = event_data.get("timestamp", datetime.now().isoformat())
+            transcript_path = event_data.get("transcript_path", "")
+            session_id = event_data.get("session_id", "")
             
             # Skip certain tool events we don't want to track
             if tool_name in ["TodoWrite", "exit_plan_mode"]:
                 return
                 
-            # Prepare message for Graphiti
-            message = self._create_message(event_data, tool_name, timestamp)
+            # Get conversation context from transcript
+            conversation_context = self._get_conversation_context(
+                transcript_path, 
+                session_id,
+                tool_name,
+                event_data
+            )
             
-            # Send to Graphiti
+            # Create and send message with context
+            message = self._create_contextual_message(
+                event_data, 
+                tool_name, 
+                timestamp,
+                conversation_context
+            )
+            
             if message:
                 self._send_to_graphiti(message)
                 
         except Exception as e:
             logger.error(f"Error processing tool event: {e}")
             
-    def _create_message(self, event_data: Dict, tool_name: str, timestamp: str) -> Optional[Dict]:
-        """Create a message formatted for Graphiti ingestion"""
+    def _get_conversation_context(self, transcript_path: str, session_id: str, 
+                                  tool_name: str, event_data: Dict) -> Dict:
+        """Extract conversation context from transcript"""
         try:
-            # Extract content based on tool type
-            content = ""
+            if not transcript_path:
+                return {"error": "No transcript path provided"}
+                
+            # Parse transcript
+            messages = self.parser.parse_transcript(transcript_path)
             
-            if tool_name == "Read":
-                file_path = event_data.get("parameters", {}).get("file_path", "")
-                content = f"Claude read file: {file_path}"
+            if not messages:
+                return {"error": "No messages found in transcript"}
                 
-            elif tool_name == "Write" or tool_name == "Edit" or tool_name == "MultiEdit":
-                file_path = event_data.get("parameters", {}).get("file_path", "")
-                content = f"Claude modified file: {file_path}"
+            # Get recent conversation context
+            recent_messages = messages[-20:]  # Last 20 messages
+            
+            # Find the most recent user request before this tool
+            last_user_request = None
+            last_assistant_response = None
+            
+            for msg in reversed(recent_messages):
+                if msg['type'] == 'user' and not last_user_request:
+                    last_user_request = msg['content']
+                elif msg['type'] == 'assistant' and not last_assistant_response:
+                    last_assistant_response = msg['content'][:500]  # Truncate
+                    
+                if last_user_request and last_assistant_response:
+                    break
+                    
+            # Get conversation summary
+            user_messages = [m for m in recent_messages if m['type'] == 'user']
+            assistant_messages = [m for m in recent_messages if m['type'] == 'assistant']
+            tool_uses = [m for m in recent_messages if m['type'] == 'tool_use']
+            
+            return {
+                "last_user_request": last_user_request or "No recent user request found",
+                "last_assistant_response": last_assistant_response or "No recent response found",
+                "recent_context": {
+                    "user_message_count": len(user_messages),
+                    "assistant_message_count": len(assistant_messages),
+                    "tool_use_count": len(tool_uses),
+                    "session_id": session_id
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting conversation context: {e}")
+            return {"error": str(e)}
+            
+    def _create_contextual_message(self, event_data: Dict, tool_name: str, 
+                                   timestamp: str, context: Dict) -> Optional[Dict]:
+        """Create a message with conversation context for Graphiti"""
+        try:
+            # Extract tool-specific information
+            tool_info = self._extract_tool_info(event_data, tool_name)
+            
+            # Build comprehensive content
+            content_parts = []
+            
+            # Add user request context
+            if context.get("last_user_request"):
+                content_parts.append(f"User request: {context['last_user_request']}")
                 
-            elif tool_name == "Bash":
-                command = event_data.get("parameters", {}).get("command", "")
-                content = f"Claude executed command: {command}"
+            # Add Claude's response context
+            if context.get("last_assistant_response"):
+                content_parts.append(f"Claude's context: {context['last_assistant_response']}")
                 
-            elif tool_name == "WebSearch":
-                query = event_data.get("parameters", {}).get("query", "")
-                content = f"Claude searched web for: {query}"
+            # Add tool action
+            content_parts.append(f"Action: {tool_info}")
+            
+            # Add context summary
+            if "recent_context" in context:
+                ctx = context["recent_context"]
+                content_parts.append(
+                    f"Session context: {ctx['user_message_count']} user messages, "
+                    f"{ctx['assistant_message_count']} assistant messages, "
+                    f"{ctx['tool_use_count']} tool uses"
+                )
                 
-            elif tool_name == "WebFetch":
-                url = event_data.get("parameters", {}).get("url", "")
-                content = f"Claude fetched URL: {url}"
-                
-            elif tool_name == "Task":
-                description = event_data.get("parameters", {}).get("description", "")
-                content = f"Claude created task: {description}"
-                
-            else:
-                # Generic message for other tools
-                params = event_data.get("parameters", {})
-                content = f"Claude used {tool_name} tool with parameters: {json.dumps(params, indent=2)}"
-                
-            if not content:
-                return None
-                
+            content = "\n\n".join(content_parts)
+            
             # Create Graphiti message
             message = {
                 "content": content,
@@ -98,23 +221,77 @@ class GraphitiIntegration:
                 "role_type": "system",
                 "role": "claude_code",
                 "timestamp": timestamp,
-                "source_description": "Claude Code conversation",
-                "group_id": CLAUDE_GROUP_ID  # Group all Claude conversations
+                "source_description": "Claude Code conversation with context",
+                "group_id": CLAUDE_GROUP_ID,
+                "metadata": {
+                    "tool_name": tool_name,
+                    "session_id": context.get("recent_context", {}).get("session_id", ""),
+                    "has_context": True
+                }
             }
             
             return message
             
         except Exception as e:
-            logger.error(f"Error creating message: {e}")
+            logger.error(f"Error creating contextual message: {e}")
             return None
             
-    def _send_to_graphiti(self, message: Dict) -> None:
-        """Send message to Graphiti API using the messages endpoint"""
+    def _extract_tool_info(self, event_data: Dict, tool_name: str) -> str:
+        """Extract tool-specific information"""
         try:
-            # Use the messages endpoint as shown in the API documentation
+            tool_input = event_data.get("tool_input", {})
+            
+            if tool_name == "Read":
+                file_path = tool_input.get("file_path", "")
+                return f"Claude read file: {file_path}"
+                
+            elif tool_name in ["Write", "Edit", "MultiEdit"]:
+                file_path = tool_input.get("file_path", "")
+                return f"Claude modified file: {file_path}"
+                
+            elif tool_name == "Bash":
+                command = tool_input.get("command", "")
+                description = tool_input.get("description", "")
+                return f"Claude executed command: {command} ({description})"
+                
+            elif tool_name == "WebSearch":
+                query = tool_input.get("query", "")
+                return f"Claude searched web for: {query}"
+                
+            elif tool_name == "WebFetch":
+                url = tool_input.get("url", "")
+                prompt = tool_input.get("prompt", "")
+                return f"Claude fetched URL: {url} (purpose: {prompt})"
+                
+            elif tool_name == "Task":
+                description = tool_input.get("description", "")
+                prompt = tool_input.get("prompt", "")[:200]
+                return f"Claude created task: {description} - {prompt}"
+                
+            elif tool_name == "Grep":
+                pattern = tool_input.get("pattern", "")
+                path = tool_input.get("path", ".")
+                return f"Claude searched for pattern '{pattern}' in {path}"
+                
+            elif tool_name == "Glob":
+                pattern = tool_input.get("pattern", "")
+                path = tool_input.get("path", ".")
+                return f"Claude searched for files matching '{pattern}' in {path}"
+                
+            else:
+                # Generic message for other tools
+                return f"Claude used {tool_name} tool: {json.dumps(tool_input)[:200]}"
+                
+        except Exception as e:
+            logger.error(f"Error extracting tool info: {e}")
+            return f"Claude used {tool_name} tool"
+            
+    def _send_to_graphiti(self, message: Dict) -> None:
+        """Send message to Graphiti API"""
+        try:
             endpoint = f"{self.base_url}/messages"
             
-            # Format the message for the messages endpoint - expects a dict with 'messages' key
+            # Format for messages endpoint
             payload = {
                 "messages": [{
                     "content": message.get("content", ""),
@@ -134,60 +311,34 @@ class GraphitiIntegration:
                 timeout=GRAPHITI_TIMEOUT
             )
             
-            if response.status_code in [200, 202]:  # 202 = Accepted for async processing
+            if response.status_code in [200, 202]:
                 logger.info(f"Successfully sent to Graphiti: {message['name']}")
             else:
                 logger.error(f"Failed to send to Graphiti: {response.status_code} - {response.text}")
-                # Try alternative endpoint if messages endpoint fails
-                self._try_alternative_endpoint(message)
                 
         except requests.exceptions.Timeout:
             logger.error("Timeout sending to Graphiti")
         except Exception as e:
             logger.error(f"Error sending to Graphiti: {e}")
             
-    def _try_alternative_endpoint(self, message: Dict) -> None:
-        """Try alternative add-memory endpoint if messages endpoint fails"""
-        try:
-            endpoint = f"{self.base_url}/add-memory"
-            
-            payload = {
-                "messages": [{
-                    "role": message.get("role_type", "system"),
-                    "content": message.get("content", ""),
-                    "metadata": {
-                        "agent_id": CLAUDE_GROUP_ID,
-                        "timestamp": message.get("timestamp", datetime.now().isoformat()),
-                        "source": message.get("source_description", "Claude Code"),
-                        "name": message.get("name", "")
-                    }
-                }]
-            }
-            
-            response = self.session.post(
-                endpoint,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=GRAPHITI_TIMEOUT
-            )
-            
-            if response.status_code == 200:
-                logger.info(f"Successfully sent to Graphiti via add-memory: {message['name']}")
-            else:
-                logger.error(f"Alternative endpoint also failed: {response.status_code}")
-                
-        except Exception as e:
-            logger.error(f"Error with alternative endpoint: {e}")
-            
     def process_notification(self, notification_data: Dict) -> None:
-        """Process Claude notifications and important messages"""
+        """Process Claude notifications"""
         try:
             message = notification_data.get("message", "")
             timestamp = notification_data.get("timestamp", datetime.now().isoformat())
+            transcript_path = notification_data.get("transcript_path", "")
+            
+            # Get minimal context for notifications
+            context = {"notification": True}
+            if transcript_path:
+                messages = self.parser.parse_transcript(transcript_path)
+                if messages:
+                    # Just get counts for notifications
+                    context["message_count"] = len(messages)
             
             # Create notification message
             graphiti_message = {
-                "content": f"Claude notification: {message}",
+                "content": f"Claude notification: {message} (Total messages in session: {context.get('message_count', 'unknown')})",
                 "name": f"Claude_Notification_{timestamp}",
                 "role_type": "system",
                 "role": "claude_code",
@@ -200,42 +351,6 @@ class GraphitiIntegration:
             
         except Exception as e:
             logger.error(f"Error processing notification: {e}")
-            
-    def search_related_context(self, query: str, max_nodes: int = 5, max_facts: int = 10) -> Dict:
-        """Search for related context in Graphiti (for future use)"""
-        try:
-            # Search nodes
-            nodes_response = self.session.post(
-                f"{self.base_url}/search/nodes",
-                json={
-                    "query": query,
-                    "max_nodes": max_nodes,
-                    "group_ids": [CLAUDE_GROUP_ID]
-                },
-                headers={"Content-Type": "application/json"},
-                timeout=GRAPHITI_TIMEOUT
-            )
-            
-            # Search facts
-            facts_response = self.session.post(
-                f"{self.base_url}/search",
-                json={
-                    "query": query,
-                    "max_facts": max_facts,
-                    "group_ids": [CLAUDE_GROUP_ID]
-                },
-                headers={"Content-Type": "application/json"},
-                timeout=GRAPHITI_TIMEOUT
-            )
-            
-            return {
-                "nodes": nodes_response.json() if nodes_response.status_code == 200 else [],
-                "facts": facts_response.json() if facts_response.status_code == 200 else []
-            }
-            
-        except Exception as e:
-            logger.error(f"Error searching Graphiti: {e}")
-            return {"nodes": [], "facts": []}
 
 def main():
     """Main entry point for hook script"""
@@ -245,7 +360,7 @@ def main():
         event_data = json.loads(event_json)
         
         # Get event type
-        event_type = event_data.get("event", "")
+        event_type = event_data.get("hook_event_name", "")
         
         # Initialize integration
         integration = GraphitiIntegration()
