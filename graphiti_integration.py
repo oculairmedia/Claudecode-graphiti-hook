@@ -13,6 +13,15 @@ from typing import Dict, List, Optional, Tuple
 import logging
 import uuid
 
+# Import session analyzer
+try:
+    from session_analyzer import SessionAnalyzer
+except ImportError:
+    # Fallback if session_analyzer is not available
+    class SessionAnalyzer:
+        def analyze_session(self, messages):
+            return {"error": "SessionAnalyzer not available"}
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -97,6 +106,7 @@ class GraphitiIntegration:
         self.base_url = GRAPHITI_URL
         self.session = requests.Session()
         self.parser = TranscriptParser()
+        self.analyzer = SessionAnalyzer()
         
     def process_tool_event(self, event_data: Dict) -> None:
         """Process Claude tool events and send to Graphiti with conversation context"""
@@ -351,6 +361,150 @@ class GraphitiIntegration:
             
         except Exception as e:
             logger.error(f"Error processing notification: {e}")
+            
+    def process_stop_event(self, stop_data: Dict) -> None:
+        """Process session stop events and create comprehensive summary"""
+        try:
+            transcript_path = stop_data.get("transcript_path", "")
+            session_id = stop_data.get("session_id", "")
+            timestamp = datetime.now().isoformat()
+            
+            if not transcript_path:
+                logger.warning("No transcript path for session summary")
+                return
+                
+            # Parse full transcript
+            messages = self.parser.parse_transcript(transcript_path)
+            if not messages:
+                logger.warning("No messages found for session summary")
+                return
+                
+            # Analyze session
+            analysis = self.analyzer.analyze_session(messages)
+            
+            # Create comprehensive session summary
+            summary_content = self._create_session_summary(analysis, session_id, len(messages))
+            
+            # Send to Graphiti
+            summary_message = {
+                "content": summary_content,
+                "name": f"Claude_Session_Summary_{timestamp}",
+                "role_type": "system",
+                "role": "claude_session_summarizer",
+                "timestamp": timestamp,
+                "source_description": "Claude Code session summary with insights",
+                "group_id": CLAUDE_GROUP_ID,
+                "metadata": {
+                    "session_id": session_id,
+                    "message_count": len(messages),
+                    "is_summary": True,
+                    "analysis": analysis
+                }
+            }
+            
+            self._send_to_graphiti(summary_message)
+            logger.info(f"Session summary sent for session {session_id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing stop event: {e}")
+            
+    def _create_session_summary(self, analysis: Dict, session_id: str, message_count: int) -> str:
+        """Create a formatted session summary"""
+        try:
+            summary_parts = [
+                f"=== SESSION SUMMARY ===",
+                f"Session ID: {session_id}",
+                f"Total Messages: {message_count}",
+                ""
+            ]
+            
+            # Add main objective
+            if analysis.get("session_goal"):
+                summary_parts.extend([
+                    "🎯 SESSION GOAL:",
+                    analysis["session_goal"],
+                    ""
+                ])
+            
+            # Add files modified
+            files_modified = analysis.get("files_modified", [])
+            if files_modified:
+                summary_parts.extend([
+                    "📁 FILES MODIFIED:",
+                    f"Total files: {len(files_modified)}"
+                ])
+                for file_info in files_modified[:5]:  # Show top 5
+                    operations = ", ".join(set(file_info.get("operations", [])))
+                    summary_parts.append(f"  • {file_info.get('file', 'Unknown')} ({operations})")
+                if len(files_modified) > 5:
+                    summary_parts.append(f"  ... and {len(files_modified) - 5} more files")
+                summary_parts.append("")
+            
+            # Add problems solved
+            problems_solved = analysis.get("problems_solved", [])
+            if problems_solved:
+                summary_parts.extend([
+                    "✅ PROBLEMS SOLVED:",
+                ])
+                for solution in problems_solved[:3]:
+                    summary_parts.append(f"  • {solution}")
+                summary_parts.append("")
+            
+            # Add key decisions
+            decisions = analysis.get("key_decisions", [])
+            if decisions:
+                summary_parts.extend([
+                    "🔄 KEY DECISIONS:",
+                ])
+                for decision in decisions[:3]:
+                    summary_parts.append(f"  • {decision}")
+                summary_parts.append("")
+            
+            # Add technologies used
+            technologies = analysis.get("technologies_used", [])
+            if technologies:
+                summary_parts.extend([
+                    "🛠️ TECHNOLOGIES USED:",
+                    f"  {', '.join(technologies)}",
+                    ""
+                ])
+            
+            # Add session metrics
+            metrics = analysis.get("session_metrics", {})
+            if metrics:
+                summary_parts.extend([
+                    "📊 SESSION METRICS:",
+                    f"  Duration: {metrics.get('session_duration', 'Unknown')}",
+                    f"  Tools used: {metrics.get('tools_used', 0)}",
+                    f"  Success rate: {metrics.get('success_rate', 'N/A')}",
+                    ""
+                ])
+            
+            # Add learnings
+            learnings = analysis.get("learning_outcomes", [])
+            if learnings:
+                summary_parts.extend([
+                    "💡 KEY LEARNINGS:",
+                ])
+                for learning in learnings:
+                    summary_parts.append(f"  • {learning}")
+                summary_parts.append("")
+            
+            # Add follow-ups
+            follow_ups = analysis.get("follow_up_items", [])
+            if follow_ups:
+                summary_parts.extend([
+                    "🔜 FOLLOW-UP ITEMS:",
+                ])
+                for follow_up in follow_ups:
+                    summary_parts.append(f"  • {follow_up}")
+                summary_parts.append("")
+            
+            return "\n".join(summary_parts)
+            
+        except Exception as e:
+            logger.error(f"Error creating session summary: {e}")
+            return f"Session summary error: {str(e)}"
 
 def main():
     """Main entry point for hook script"""
@@ -370,6 +524,8 @@ def main():
             integration.process_tool_event(event_data)
         elif event_type == "Notification":
             integration.process_notification(event_data)
+        elif event_type == "Stop":
+            integration.process_stop_event(event_data)
             
     except Exception as e:
         logger.error(f"Hook error: {e}")
